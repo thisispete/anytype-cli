@@ -1,0 +1,90 @@
+name: Build patched image
+
+# Builds this fork's patched anytype-cli (see core/auth.go's PreferYamuxTransport
+# patch, and hermes-anytype's docs/design.md Section 10 for why) and pushes a
+# Docker image to ghcr.io/thisispete/anytype-cli.
+#
+# Binaries are built natively per-architecture inside golang:1.25-alpine (not
+# on the bare Ubuntu runner) because anyproto/tantivy-go's Linux releases are
+# musl-only (linux-${arch}-musl.tar.gz) -- matching Alpine's libc, not
+# Ubuntu's glibc. Building inside Alpine avoids needing a musl cross-compiler
+# toolchain and matches upstream's own runtime image (alpine:3.23) exactly,
+# so the existing Dockerfile is reused unmodified.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-binary:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build anytype-linux-${{ matrix.arch }} inside golang:1.25-alpine (native, no cross-compile)
+        run: |
+          docker run --rm -v "$PWD":/src -w /src golang:1.25-alpine sh -euc '
+            apk add --no-cache build-base curl
+            TANTIVY_VERSION=$(grep "github.com/anyproto/tantivy-go" go.mod | awk "{print \$2}")
+            mkdir -p dist/tantivy
+            curl -fL "https://github.com/anyproto/tantivy-go/releases/download/${TANTIVY_VERSION}/linux-${{ matrix.arch }}-musl.tar.gz" | tar xz -C dist/tantivy
+            CGO_ENABLED=1 CGO_LDFLAGS="-Ldist/tantivy" go build -ldflags "-s -w" -o anytype-linux-${{ matrix.arch }} .
+          '
+          ls -la anytype-linux-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anytype-linux-${{ matrix.arch }}
+          path: anytype-linux-${{ matrix.arch }}
+
+  build-image:
+    needs: build-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: anytype-linux-amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: anytype-linux-arm64
+
+      - run: chmod +x anytype-linux-amd64 anytype-linux-arm64 && ls -la anytype-linux-*
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Reuses the repo's own Dockerfile unmodified -- it already expects
+      # exactly anytype-linux-${TARGETARCH} in the build context.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/thisispete/anytype-cli:patched
+            ghcr.io/thisispete/anytype-cli:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/thisispete/anytype-cli
+            org.opencontainers.image.description=anytype-cli patched to prefer yamux/TCP over QUIC for bot-account auto-login (see hermes-anytype docs/design.md Section 10)
+            org.opencontainers.image.licenses=MIT
