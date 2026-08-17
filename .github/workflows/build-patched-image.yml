@@ -42,6 +42,7 @@ jobs:
           # tester.
           docker run --rm -v "$PWD":/src -w /src \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -e CLI_VERSION="0.0.0-hermes-anytype-patch-$(git rev-parse --short HEAD)" \
             golang:1.25-alpine sh -euc '
             apk add --no-cache build-base curl file binutils
             TANTIVY_VERSION=$(grep "github.com/anyproto/tantivy-go" go.mod | awk "{print \$2}")
@@ -61,8 +62,20 @@ jobs:
             # path for DNS (getaddrinfo); the pure-Go resolver this tag
             # selects sidesteps that entirely -- defensive, given this
             # binary exists specifically to resolve a coordinator hostname.
+            # -X core.Version=...: upstream'"'"'s own Makefile always injects this
+            # via ldflags (from `git describe --tags`); this build skipped it
+            # entirely, leaving core.Version empty. anytype-heart'"'"'s
+            # InitialSetParameters handler rejects an empty Version with a
+            # BAD_INPUT response -- but CreateWallet (the auth-create path)
+            # discards that response and only checks the transport-level Go
+            # error, so the rejection was silently swallowed and execution
+            # continued anyway, straight into a server-side panic later in
+            # AccountCreate ("client platform with the version must be set").
+            # Caught live by a beta tester, not this pipeline -- the smoke
+            # test only checks the binary starts and prints --help, not that
+            # a full auth create call succeeds.
             CGO_ENABLED=1 CGO_LDFLAGS="-Ldist/tantivy" go build -tags netgo \
-              -ldflags "-s -w -linkmode external -extldflags -static" \
+              -ldflags "-s -w -linkmode external -extldflags -static -X github.com/anyproto/anytype-cli/core.Version=${CLI_VERSION}" \
               -o anytype-linux-${{ matrix.arch }} .
             echo "--- verifying static linking ---"
             file anytype-linux-${{ matrix.arch }}
@@ -80,6 +93,27 @@ jobs:
         run: |
           chmod +x anytype-linux-${{ matrix.arch }}
           docker run --rm -v "$PWD":/test alpine:3.23 /test/anytype-linux-${{ matrix.arch }} --help
+
+      # A --help smoke test only proves the binary starts -- it does not
+      # exercise a real RPC. That's exactly the gap that let a build with
+      # an empty core.Version ship: the binary ran, printed --help fine,
+      # and only panicked on the first real account-creation call. This
+      # step actually creates a throwaway account against the real Anytype
+      # network, inside a container matching the runtime image exactly, so
+      # this class of bug fails the build instead of reaching a tester.
+      - name: Functional smoke-test -- actually create a throwaway account
+        run: |
+          docker run --rm -v "$PWD":/test -w /test alpine:3.23 sh -euc '
+            apk add --no-cache ca-certificates
+            ./anytype-linux-${{ matrix.arch }} serve &
+            SERVER_PID=$!
+            sleep 2
+            ./anytype-linux-${{ matrix.arch }} auth create ci-smoke-test-${{ matrix.arch }}
+            STATUS=$?
+            kill $SERVER_PID 2>/dev/null || true
+            wait $SERVER_PID 2>/dev/null || true
+            exit $STATUS
+          '
 
       - uses: actions/upload-artifact@v4
         with:
