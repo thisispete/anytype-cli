@@ -119,6 +119,21 @@ func Authenticate(accountKey, rootPath, apiAddr, networkConfigPath string) error
 			RootPath:                    rootPath,
 			NetworkMode:                 networkMode,
 			NetworkCustomConfigFilePath: networkConfigPath,
+			// Patched (hermes-anytype): anytype-heart's own config.go has a
+			// PeferYamuxTransport escape hatch documented in-code as "used
+			// only in case client has some problems with QUIC" -- exactly
+			// this situation, confirmed via source-level tracing plus a
+			// live isolation test (fresh account creation succeeds over
+			// QUIC; recovering an *existing* stored account -- this exact
+			// AccountSelect call, reached via attemptAutoLogin() ->
+			// Authenticate() -- reproducibly times out under Docker
+			// Desktop). anytype-cli upstream never sets this field on this
+			// call. Scoped to just this request (not the AccountCreate ->
+			// AccountSelect pair in CreateAccount below, which is confirmed
+			// already working over QUIC) -- see docs/design.md Section 10
+			// in hermes-anytype for the full investigation before
+			// considering this fix stale.
+			PreferYamuxTransport: true,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to select account: %w", err)
